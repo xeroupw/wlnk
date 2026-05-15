@@ -1,0 +1,8 @@
+[package]
+name = "wlnk"
+version = "0.1.0"
+edition = "2021"
+description = "lightweight PE (x64) linker for Windows"
+license = "MIT"
+
+[dependencies]
