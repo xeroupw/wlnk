@@ -1,0 +1,112 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: build wlnk
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: setup msvc environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: run tests
+        shell: pwsh
+        run: |
+          $wlnk = "target\x86_64-pc-windows-msvc\release\wlnk.exe"
+          $tests_dir = ".github\tests"
+          $passed = 0
+          $failed = 0
+          $errors = @()
+
+          # find all .c test files
+          $tests = Get-ChildItem -Path $tests_dir -Filter "*.c"
+
+          if ($tests.Count -eq 0) {
+            Write-Host "no test files found in $tests_dir"
+            exit 1
+          }
+
+          foreach ($test in $tests) {
+            $name = $test.BaseName
+            $c_file = $test.FullName
+            $expected_file = Join-Path $tests_dir "$name.expected"
+            $obj_file = Join-Path $env:TEMP "$name.obj"
+            $exe_file = Join-Path $env:TEMP "$name.exe"
+
+            if (-not (Test-Path $expected_file)) {
+              Write-Host "SKIP $name (no .expected file)"
+              continue
+            }
+
+            # compile .c -> .obj with cl.exe (no link step)
+            $cl_out = cl.exe /nologo /c /O2 /GS- "$c_file" /Fo"$obj_file" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              $failed++
+              $errors += "FAIL $name : cl.exe failed: $cl_out"
+              continue
+            }
+
+            # link .obj -> .exe with wlnk
+            # lib path from msvc dev env: kernel32.lib etc live in $env:LIB
+            $lib_dirs = $env:LIB -split ';' | Where-Object { $_ -ne '' }
+            $lib_args = ($lib_dirs | ForEach-Object { "--lib `"$_`"" }) -join ' '
+            $wlnk_cmd = "& `"$wlnk`" `"$obj_file`" -o `"$exe_file`" --subsystem console --entry main $lib_args"
+            $wlnk_out = Invoke-Expression $wlnk_cmd 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              $failed++
+              $errors += "FAIL $name : wlnk failed: $wlnk_out"
+              continue
+            }
+
+            # run and capture stdout
+            $actual = & "$exe_file" 2>&1
+            $expected = Get-Content $expected_file -Raw
+
+            # normalize line endings for comparison
+            $actual_norm = ($actual | Out-String).Trim().Replace("`r`n", "`n")
+            $expected_norm = $expected.Trim().Replace("`r`n", "`n")
+
+            if ($actual_norm -eq $expected_norm) {
+              $passed++
+              Write-Host "PASS $name"
+            } else {
+              $failed++
+              $errors += "FAIL $name`n  expected: $expected_norm`n  actual:   $actual_norm"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "results: $passed passed, $failed failed"
+
+          if ($errors.Count -gt 0) {
+            Write-Host ""
+            foreach ($e in $errors) { Write-Host $e }
+            exit 1
+          }
