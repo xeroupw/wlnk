@@ -72,19 +72,21 @@ jobs:
               return
             }
 
+            # run with timeout; use cmd /c so WriteFile stdout is inherited correctly
             $stdout_file = "$env:TEMP\$name.stdout"
-            $proc = Start-Process `
-              -FilePath "$exe_file" `
-              -RedirectStandardOutput "$stdout_file" `
-              -NoNewWindow `
-              -PassThru
-            $exited = $proc.WaitForExit(5000)
-            if (-not $exited) {
-              $proc.Kill()
+            $job = Start-Job -ScriptBlock {
+              param($exe, $out)
+              & cmd /c "`"$exe`" > `"$out`" 2>&1"
+            } -ArgumentList $exe_file, $stdout_file
+            $done = Wait-Job $job -Timeout 5
+            if (-not $done) {
+              Stop-Job $job
+              Remove-Job $job -Force
               $script:failed++
               $script:errors += "FAIL $name : exe timed out after 5s"
               return
             }
+            Remove-Job $job -Force
 
             $actual_raw = if (Test-Path $stdout_file) { Get-Content $stdout_file -Raw } else { "" }
             $actual_raw = if ($null -eq $actual_raw) { "" } else { $actual_raw }
