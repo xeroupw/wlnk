@@ -44,17 +44,41 @@ jobs:
           $passed = 0
           $failed = 0
           $errors = @()
+          $lib_dirs = $env:LIB -split ';' | Where-Object { $_ -ne '' }
+          $lib_args = $lib_dirs | ForEach-Object { "--lib"; $_ }
 
-          $tests = Get-ChildItem -Path $tests_dir -Filter "*.c"
+          function Run-Test {
+            param($name, $obj_files, $expected_file, $exe_file)
 
-          if ($tests.Count -eq 0) {
-            Write-Host "no test files found in $tests_dir"
-            exit 1
+            Write-Host "--- $name wlnk call ---"
+            & "$wlnk" @obj_files -o "$exe_file" --subsystem console --entry main @lib_args
+            if ($LASTEXITCODE -ne 0) { return "wlnk exited $LASTEXITCODE" }
+
+            $proc = Start-Process -FilePath "$exe_file" -PassThru `
+              -RedirectStandardOutput "$env:TEMP\$name.stdout" -NoNewWindow
+            $exited = $proc.WaitForExit(5000)
+            if (-not $exited) {
+              $proc.Kill()
+              return "exe timed out after 5s"
+            }
+
+            $actual_raw = Get-Content "$env:TEMP\$name.stdout" -Raw
+            $actual_raw = if ($null -eq $actual_raw) { "" } else { $actual_raw }
+            $expected_raw = Get-Content $expected_file -Raw
+            $expected_raw = if ($null -eq $expected_raw) { "" } else { $expected_raw }
+
+            $actual_norm = $actual_raw.Trim().Replace("`r`n", "`n")
+            $expected_norm = $expected_raw.Trim().Replace("`r`n", "`n")
+
+            if ($actual_norm -ne $expected_norm) {
+              return "expected: $expected_norm`n  actual: $actual_norm"
+            }
+            return $null
           }
 
-          foreach ($test in $tests) {
+          # single .c file tests
+          foreach ($test in Get-ChildItem -Path $tests_dir -Filter "*.c") {
             $name = $test.BaseName
-            $c_file = $test.FullName
             $expected_file = Join-Path $tests_dir "$name.expected"
             $obj_file = Join-Path $env:TEMP "$name.obj"
             $exe_file = Join-Path $env:TEMP "$name.exe"
@@ -64,60 +88,53 @@ jobs:
               continue
             }
 
-            # compile .c -> .obj
-            $cl_out = cl.exe /nologo /c /O2 /GS- "$c_file" /Fo"$obj_file" 2>&1
+            $cl_out = cl.exe /nologo /c /O2 /GS- $test.FullName /Fo"$obj_file" 2>&1
             if ($LASTEXITCODE -ne 0) {
               $failed++
               $errors += "FAIL $name : cl.exe failed:`n$cl_out"
               continue
             }
 
-            # print undefined externals for diagnostics
-            Write-Host "--- $name undefined symbols ---"
-            & "dumpbin.exe" /nologo /symbols "$obj_file" 2>&1 |
-              Where-Object { $_ -match "External\s+\|" } |
-              ForEach-Object { Write-Host "  $_" }
+            $err = Run-Test $name @($obj_file) $expected_file $exe_file
+            if ($null -eq $err) { $passed++; Write-Host "PASS $name" }
+            else { $failed++; $errors += "FAIL $name : $err" }
+          }
 
-            # link with wlnk — stderr goes live to log
-            $lib_dirs = $env:LIB -split ';' | Where-Object { $_ -ne '' }
-            $lib_args = $lib_dirs | ForEach-Object { "--lib"; $_ }
-            Write-Host "--- $name wlnk call ---"
-            & "$wlnk" "$obj_file" -o "$exe_file" --subsystem console --entry main @lib_args
-            $wlnk_exit = $LASTEXITCODE
+          # multi-obj tests: each subdirectory with an expected file
+          foreach ($dir in Get-ChildItem -Path $tests_dir -Directory) {
+            $name = $dir.Name
+            $expected_file = Join-Path $dir.FullName "expected"
 
-            if ($wlnk_exit -ne 0) {
-              $failed++
-              $errors += "FAIL $name : wlnk exited $wlnk_exit"
+            if (-not (Test-Path $expected_file)) {
+              Write-Host "SKIP $name (no expected file)"
               continue
             }
 
-            # run with 5 second timeout to catch hangs from bad IAT/relocs
-            $proc = Start-Process -FilePath "$exe_file" -PassThru -RedirectStandardOutput "$env:TEMP\$name.stdout" -NoNewWindow
-            $exited = $proc.WaitForExit(5000)
-
-            if (-not $exited) {
-              $proc.Kill()
-              $failed++
-              $errors += "FAIL $name : exe timed out after 5s"
+            $sources = Get-ChildItem -Path $dir.FullName -Filter "*.c"
+            if ($sources.Count -eq 0) {
+              Write-Host "SKIP $name (no .c files)"
               continue
             }
 
-            $actual_raw = Get-Content "$env:TEMP\$name.stdout" -Raw
-            $actual_raw = if ($null -eq $actual_raw) { "" } else { $actual_raw }
-
-            $expected_raw = Get-Content $expected_file -Raw
-            $expected_raw = if ($null -eq $expected_raw) { "" } else { $expected_raw }
-
-            $actual_norm = $actual_raw.Trim().Replace("`r`n", "`n")
-            $expected_norm = $expected_raw.Trim().Replace("`r`n", "`n")
-
-            if ($actual_norm -eq $expected_norm) {
-              $passed++
-              Write-Host "PASS $name"
-            } else {
-              $failed++
-              $errors += "FAIL $name`n  expected: $expected_norm`n  actual:   $actual_norm"
+            $obj_files = @()
+            $compile_ok = $true
+            foreach ($src in $sources) {
+              $obj = Join-Path $env:TEMP "$name-$($src.BaseName).obj"
+              $cl_out = cl.exe /nologo /c /O2 /GS- $src.FullName /Fo"$obj" 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $failed++
+                $errors += "FAIL $name : cl.exe failed on $($src.Name):`n$cl_out"
+                $compile_ok = $false
+                break
+              }
+              $obj_files += $obj
             }
+            if (-not $compile_ok) { continue }
+
+            $exe_file = Join-Path $env:TEMP "$name.exe"
+            $err = Run-Test $name $obj_files $expected_file $exe_file
+            if ($null -eq $err) { $passed++; Write-Host "PASS $name" }
+            else { $failed++; $errors += "FAIL $name : $err" }
           }
 
           Write-Host ""
