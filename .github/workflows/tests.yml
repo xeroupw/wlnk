@@ -45,7 +45,6 @@ jobs:
           $failed = 0
           $errors = @()
 
-          # find all .c test files
           $tests = Get-ChildItem -Path $tests_dir -Filter "*.c"
 
           if ($tests.Count -eq 0) {
@@ -65,34 +64,39 @@ jobs:
               continue
             }
 
-            # compile .c -> .obj with cl.exe (no link step)
+            # compile .c -> .obj
             $cl_out = cl.exe /nologo /c /O2 /GS- "$c_file" /Fo"$obj_file" 2>&1
             if ($LASTEXITCODE -ne 0) {
               $failed++
-              $errors += "FAIL $name : cl.exe failed: $cl_out"
+              $errors += "FAIL $name : cl.exe failed:`n$cl_out"
               continue
             }
 
-            # link .obj -> .exe with wlnk
-            # lib path from msvc dev env: kernel32.lib etc live in $env:LIB
+            # print what symbols the obj references (helps debug import issues)
+            Write-Host "--- $name undefined symbols ---"
+            & "dumpbin.exe" /nologo /symbols "$obj_file" 2>&1 |
+              Where-Object { $_ -match "External\s+\|" } |
+              ForEach-Object { Write-Host "  $_" }
+
+            # link with wlnk — run directly so stderr prints live to the log
             $lib_dirs = $env:LIB -split ';' | Where-Object { $_ -ne '' }
-            $lib_args = ($lib_dirs | ForEach-Object { "--lib `"$_`"" }) -join ' '
-            $wlnk_cmd = "& `"$wlnk`" `"$obj_file`" -o `"$exe_file`" --subsystem console --entry main $lib_args"
-            $wlnk_out = Invoke-Expression $wlnk_cmd 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            $lib_args = $lib_dirs | ForEach-Object { "--lib"; $_ }
+            Write-Host "--- $name wlnk call ---"
+            & "$wlnk" "$obj_file" -o "$exe_file" --subsystem console --entry main @lib_args
+            $wlnk_exit = $LASTEXITCODE
+
+            if ($wlnk_exit -ne 0) {
               $failed++
-              $errors += "FAIL $name : wlnk failed: $wlnk_out"
+              $errors += "FAIL $name : wlnk exited $wlnk_exit"
               continue
             }
 
             # run and capture stdout
             $actual = & "$exe_file" 2>&1
 
-            # Get-Content returns $null for empty files — coerce to empty string
             $expected_raw = Get-Content $expected_file -Raw
             $expected_raw = if ($null -eq $expected_raw) { "" } else { $expected_raw }
 
-            # normalize line endings for comparison
             $actual_norm = if ($null -eq $actual) { "" } else { ($actual | Out-String).Trim().Replace("`r`n", "`n") }
             $expected_norm = $expected_raw.Trim().Replace("`r`n", "`n")
 
