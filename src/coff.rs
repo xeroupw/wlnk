@@ -2,10 +2,10 @@
 // parses COFF (.obj) files produced by x64 assemblers/compilers
 // spec: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use crate::error::LinkError;
 
-// machine constant for x64
 pub const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,7 @@ pub struct Section {
 #[derive(Debug, Clone)]
 pub struct Relocation {
     pub virtual_address: u32,
+    // raw COFF symbol table index, counting auxiliary records
     pub symbol_index: u32,
     pub reloc_type: u16,
 }
@@ -51,12 +52,10 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    // returns true if symbol is externally visible
     pub fn is_external(&self) -> bool {
         self.storage_class == 2
     }
 
-    // returns true if symbol is defined in a section (not external or absolute)
     pub fn is_defined(&self) -> bool {
         self.section_number > 0
     }
@@ -66,12 +65,22 @@ impl Symbol {
 pub struct CoffObject {
     pub header: CoffHeader,
     pub sections: Vec<Section>,
+    // flat list of non-auxiliary symbols in declaration order
     pub symbols: Vec<Symbol>,
+    // maps raw COFF symbol table index -> index into self.symbols
+    // needed because relocation entries reference raw indices which skip auxiliary records
+    pub symbol_index_map: HashMap<u32, usize>,
+}
+
+impl CoffObject {
+    // looks up a symbol by its raw COFF table index as stored in relocation entries
+    pub fn symbol_by_coff_index(&self, coff_idx: u32) -> Option<&Symbol> {
+        self.symbol_index_map.get(&coff_idx).map(|&i| &self.symbols[i])
+    }
 }
 
 pub fn parse(data: &[u8]) -> Result<CoffObject, LinkError> {
     let mut cur = Cursor::new(data);
-
     let header = parse_header(&mut cur)?;
 
     if header.machine != IMAGE_FILE_MACHINE_AMD64 {
@@ -82,9 +91,9 @@ pub fn parse(data: &[u8]) -> Result<CoffObject, LinkError> {
     }
 
     let sections = parse_sections(&mut cur, &header, data)?;
-    let symbols = parse_symbols(data, &header)?;
+    let (symbols, symbol_index_map) = parse_symbols(data, &header)?;
 
-    Ok(CoffObject { header, sections, symbols })
+    Ok(CoffObject { header, sections, symbols, symbol_index_map })
 }
 
 fn parse_header(cur: &mut Cursor<&[u8]>) -> Result<CoffHeader, LinkError> {
@@ -100,11 +109,9 @@ fn parse_header(cur: &mut Cursor<&[u8]>) -> Result<CoffHeader, LinkError> {
 }
 
 fn parse_sections(cur: &mut Cursor<&[u8]>, header: &CoffHeader, raw: &[u8]) -> Result<Vec<Section>, LinkError> {
-    // skip optional header if present (unusual in .obj but possible)
     let skip = header.optional_header_size as u64;
     if skip > 0 {
-        let pos = cur.position() + skip;
-        cur.set_position(pos);
+        cur.set_position(cur.position() + skip);
     }
 
     let mut sections = Vec::with_capacity(header.num_sections as usize);
@@ -145,7 +152,6 @@ fn parse_sections(cur: &mut Cursor<&[u8]>, header: &CoffHeader, raw: &[u8]) -> R
 }
 
 fn resolve_section_name(name_bytes: &[u8; 8], raw: &[u8], header: &CoffHeader) -> Result<String, LinkError> {
-    // long names start with '/' followed by decimal offset into string table
     if name_bytes[0] == b'/' {
         let offset_str = std::str::from_utf8(&name_bytes[1..])
             .unwrap_or("")
@@ -155,8 +161,6 @@ fn resolve_section_name(name_bytes: &[u8; 8], raw: &[u8], header: &CoffHeader) -
             return read_string_from_table(raw, strtab_start, offset);
         }
     }
-
-    // short name: null-terminated within 8 bytes
     let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
     Ok(String::from_utf8_lossy(&name_bytes[..end]).into_owned())
 }
@@ -183,48 +187,51 @@ fn parse_relocations(raw: &[u8], offset: usize, count: usize) -> Result<Vec<Relo
     Ok(relocs)
 }
 
-fn parse_symbols(raw: &[u8], header: &CoffHeader) -> Result<Vec<Symbol>, LinkError> {
+// returns (symbols vec, coff_index -> vec_index map)
+// coff_index counts every 18-byte slot including auxiliaries;
+// vec_index is the position of the primary record in the returned Vec
+fn parse_symbols(raw: &[u8], header: &CoffHeader) -> Result<(Vec<Symbol>, HashMap<u32, usize>), LinkError> {
     if header.num_symbols == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), HashMap::new()));
     }
 
     let sym_offset = header.symbol_table_offset as usize;
     let strtab_start = sym_offset + header.num_symbols as usize * 18;
 
     let mut symbols = Vec::new();
-    let mut i = 0usize;
+    let mut index_map: HashMap<u32, usize> = HashMap::new();
+    let mut i = 0u32;
 
-    while i < header.num_symbols as usize {
-        let pos = sym_offset + i * 18;
+    while i < header.num_symbols {
+        let pos = sym_offset + i as usize * 18;
         if pos + 18 > raw.len() {
             return Err(LinkError::Coff("symbol entry out of bounds".into()));
         }
 
         let name_bytes: [u8; 8] = raw[pos..pos+8].try_into().unwrap();
         let name = resolve_symbol_name(&name_bytes, raw, strtab_start)?;
-
         let value = u32::from_le_bytes(raw[pos+8..pos+12].try_into().unwrap());
         let section_number = i16::from_le_bytes(raw[pos+12..pos+14].try_into().unwrap());
         let sym_type = u16::from_le_bytes(raw[pos+14..pos+16].try_into().unwrap());
         let storage_class = raw[pos+16];
         let num_aux = raw[pos+17];
 
+        let vec_idx = symbols.len();
+        // map this raw coff index to its position in the Vec
+        index_map.insert(i, vec_idx);
         symbols.push(Symbol { name, value, section_number, sym_type, storage_class, num_aux });
 
-        // skip auxiliary records
-        i += 1 + num_aux as usize;
+        i += 1 + num_aux as u32;
     }
 
-    Ok(symbols)
+    Ok((symbols, index_map))
 }
 
 fn resolve_symbol_name(name_bytes: &[u8; 8], raw: &[u8], strtab_start: usize) -> Result<String, LinkError> {
-    // if first 4 bytes are zero, next 4 bytes are offset into string table
     if name_bytes[0..4] == [0, 0, 0, 0] {
         let offset = u32::from_le_bytes(name_bytes[4..8].try_into().unwrap()) as usize;
         return read_string_from_table(raw, strtab_start, offset);
     }
-
     let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
     Ok(String::from_utf8_lossy(&name_bytes[..end]).into_owned())
 }

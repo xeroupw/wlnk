@@ -163,7 +163,7 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
             let section_va = section_rvas[&canon] as u64 + sec_base_offset as u64 + IMAGE_BASE;
 
             for reloc in &sec.relocations {
-                let target_sym = obj.symbols.get(reloc.symbol_index as usize)
+                let target_sym = obj.symbol_by_coff_index(reloc.symbol_index)
                     .ok_or_else(|| LinkError::Reloc(format!(
                         "relocation references out-of-bounds symbol index {}", reloc.symbol_index
                     )))?;
