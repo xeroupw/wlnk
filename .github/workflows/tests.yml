@@ -72,13 +72,13 @@ jobs:
               continue
             }
 
-            # print what symbols the obj references (helps debug import issues)
+            # print undefined externals for diagnostics
             Write-Host "--- $name undefined symbols ---"
             & "dumpbin.exe" /nologo /symbols "$obj_file" 2>&1 |
               Where-Object { $_ -match "External\s+\|" } |
               ForEach-Object { Write-Host "  $_" }
 
-            # link with wlnk — run directly so stderr prints live to the log
+            # link with wlnk — stderr goes live to log
             $lib_dirs = $env:LIB -split ';' | Where-Object { $_ -ne '' }
             $lib_args = $lib_dirs | ForEach-Object { "--lib"; $_ }
             Write-Host "--- $name wlnk call ---"
@@ -91,13 +91,24 @@ jobs:
               continue
             }
 
-            # run and capture stdout
-            $actual = & "$exe_file" 2>&1
+            # run with 5 second timeout to catch hangs from bad IAT/relocs
+            $proc = Start-Process -FilePath "$exe_file" -PassThru -RedirectStandardOutput "$env:TEMP\$name.stdout" -NoNewWindow
+            $exited = $proc.WaitForExit(5000)
+
+            if (-not $exited) {
+              $proc.Kill()
+              $failed++
+              $errors += "FAIL $name : exe timed out after 5s"
+              continue
+            }
+
+            $actual_raw = Get-Content "$env:TEMP\$name.stdout" -Raw
+            $actual_raw = if ($null -eq $actual_raw) { "" } else { $actual_raw }
 
             $expected_raw = Get-Content $expected_file -Raw
             $expected_raw = if ($null -eq $expected_raw) { "" } else { $expected_raw }
 
-            $actual_norm = if ($null -eq $actual) { "" } else { ($actual | Out-String).Trim().Replace("`r`n", "`n") }
+            $actual_norm = $actual_raw.Trim().Replace("`r`n", "`n")
             $expected_norm = $expected_raw.Trim().Replace("`r`n", "`n")
 
             if ($actual_norm -eq $expected_norm) {
