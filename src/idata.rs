@@ -10,8 +10,10 @@ use crate::error::LinkError;
 // one imported symbol from a DLL
 #[derive(Debug, Clone)]
 pub struct ImportSymbol {
-    pub name: String,
-    // hint is the ordinal hint from the .lib — 0 if unknown
+    // undecorated name as it appears in the DLL export table (e.g. "WriteFile")
+    pub export_name: String,
+    // name used in object files to reference via IAT pointer (e.g. "__imp_WriteFile")
+    pub imp_name: String,
     pub hint: u16,
 }
 
@@ -24,16 +26,15 @@ pub struct ImportDll {
 
 // fully built .idata blob with VA fixup info
 pub struct ImportTable {
-    // raw bytes of the complete .idata section
     pub data: Vec<u8>,
-    // maps symbol name -> RVA of its IAT slot (8-byte entry, holds address at runtime)
+    // maps imp_name -> RVA of its IAT slot
     pub iat_rvas: HashMap<String, u32>,
-    // RVA of the import directory table (IMAGE_IMPORT_DESCRIPTOR array)
     pub directory_rva: u32,
 }
 
-// searches lib directories for .lib files and parses imported symbols
-// only reads COFF import library short records (second linker member / per-symbol entries)
+// searches lib directories for .lib files and collects imports for referenced symbols
+// referenced contains raw symbol names as seen in COFF undefined externals,
+// which may be "__imp_WriteFile" style (indirect) or "WriteFile" style (direct)
 pub fn collect_imports(
     lib_dirs: &[PathBuf],
     referenced: &[String],
@@ -61,13 +62,12 @@ pub fn collect_imports(
     Ok(by_dll.into_values().collect())
 }
 
-// parses an AR-format .lib archive and extracts import short records
+// parses an AR-format .lib archive and extracts COFF import short records
 fn parse_lib(
     data: &[u8],
     referenced: &[String],
     by_dll: &mut HashMap<String, ImportDll>,
 ) -> Result<(), LinkError> {
-    // AR magic: "!<arch>\n"
     if data.len() < 8 || &data[..8] != b"!<arch>\n" {
         return Ok(());
     }
@@ -75,28 +75,31 @@ fn parse_lib(
     let mut pos = 8usize;
 
     while pos + 60 <= data.len() {
-        // AR member header is 60 bytes
-        let _name_bytes = &data[pos..pos+16];
         let size_bytes = &data[pos+48..pos+58];
-
-        let size_str = std::str::from_utf8(size_bytes)
+        let member_size: usize = std::str::from_utf8(size_bytes)
             .unwrap_or("0")
-            .trim();
-        let member_size: usize = size_str.parse().unwrap_or(0);
+            .trim()
+            .parse()
+            .unwrap_or(0);
 
         pos += 60;
-        let member_data = data.get(pos..pos+member_size).unwrap_or(&[]);
+        let member_data = match data.get(pos..pos+member_size) {
+            Some(d) => d,
+            None => break,
+        };
 
-        // import short record: machine(2) + sig1(2)=0 + sig2(2)=0xFFFF
-        // actual layout: sig1=0x0000, sig2=0xFFFF, version, machine, time, size, hint, type/nametype
+        // COFF import short record signature: sig1=0x0000, sig2=0xFFFF
+        // layout: sig1(2) sig2(2) version(2) machine(2) timeDateStamp(4)
+        //         sizeOfData(4) ordinalOrHint(2) type:nameType(2)
+        //         symbol_name\0 dll_name\0
         if member_size >= 20 {
             let sig1 = u16::from_le_bytes([member_data[0], member_data[1]]);
             let sig2 = u16::from_le_bytes([member_data[2], member_data[3]]);
 
             if sig1 == 0x0000 && sig2 == 0xFFFF {
-                // this is an import short record
                 let hint = u16::from_le_bytes([member_data[12], member_data[13]]);
-                // strings follow: symbol_name\0 dll_name\0
+                let name_type = (member_data[15] >> 2) & 0x7;
+
                 let strings_start = 20;
                 if let Some(sym_end) = member_data[strings_start..].iter().position(|&b| b == 0) {
                     let sym_name = String::from_utf8_lossy(
@@ -109,13 +112,28 @@ fn parse_lib(
                             &member_data[dll_start..dll_start+dll_end]
                         ).into_owned().to_lowercase();
 
-                        if referenced.contains(&sym_name) {
+                        // derive both the export name and the __imp_ variant
+                        // name_type 0 = no prefix, 1 = no underscore, 2 = undecorate
+                        let export_name = undecorate(&sym_name, name_type);
+                        let imp_name = format!("__imp_{}", export_name);
+
+                        // match if any referenced symbol names this import
+                        // either as direct call (export_name) or indirect (__imp_ pointer)
+                        let is_referenced = referenced.iter().any(|r| {
+                            r == &sym_name || r == &export_name || r == &imp_name
+                        });
+
+                        if is_referenced {
                             let entry = by_dll.entry(dll_name.clone()).or_insert_with(|| ImportDll {
                                 dll_name: dll_name.clone(),
                                 symbols: Vec::new(),
                             });
-                            if !entry.symbols.iter().any(|s| s.name == sym_name) {
-                                entry.symbols.push(ImportSymbol { name: sym_name, hint });
+                            if !entry.symbols.iter().any(|s| s.export_name == export_name) {
+                                entry.symbols.push(ImportSymbol {
+                                    export_name,
+                                    imp_name,
+                                    hint,
+                                });
                             }
                         }
                     }
@@ -123,7 +141,6 @@ fn parse_lib(
             }
         }
 
-        // advance, keeping AR 2-byte alignment
         pos += member_size;
         if pos % 2 != 0 {
             pos += 1;
@@ -133,13 +150,33 @@ fn parse_lib(
     Ok(())
 }
 
-// builds the raw .idata section bytes and returns import table metadata
-// layout per DLL:
-//   IMAGE_IMPORT_DESCRIPTOR (20 bytes each) + null terminator
-//   import lookup table (ILT): array of 8-byte entries per symbol + null
-//   import address table (IAT): same layout as ILT, patched by loader at runtime
-//   hint/name table: u16 hint + name + null byte (word-aligned)
-//   DLL name strings
+// strips common MSVC decoration from symbol name to get the export name
+// name_type from the import short record controls which stripping applies
+fn undecorate(name: &str, name_type: u8) -> String {
+    match name_type {
+        // IMPORT_NAME_UNDECORATE: strip leading '?' or '_', strip trailing '@...'
+        2 => {
+            let s = name.trim_start_matches('_').trim_start_matches('?');
+            if let Some(at) = s.find('@') {
+                s[..at].to_string()
+            } else {
+                s.to_string()
+            }
+        }
+        // IMPORT_NAME_NO_PREFIX: strip leading '_' or '@' or '?'
+        1 => name.trim_start_matches(|c| c == '_' || c == '@' || c == '?').to_string(),
+        // IMPORT_NAME: use as-is (already the export name)
+        _ => name.to_string(),
+    }
+}
+
+// builds the raw .idata section and returns metadata for relocation patching
+// layout:
+//   IMAGE_IMPORT_DESCRIPTOR array — (num_dlls + 1) * 20 bytes, null-terminated
+//   ILT per DLL — (num_symbols + 1) * 8 bytes, null-terminated
+//   IAT per DLL — same layout as ILT, patched by loader at runtime
+//   hint/name entries — u16 hint + ASCII name + null + optional pad byte
+//   DLL name strings — ASCII + null + optional pad byte
 pub fn build(dlls: &[ImportDll], section_rva: u32) -> Result<ImportTable, LinkError> {
     if dlls.is_empty() {
         return Ok(ImportTable {
@@ -150,12 +187,8 @@ pub fn build(dlls: &[ImportDll], section_rva: u32) -> Result<ImportTable, LinkEr
     }
 
     let num_dlls = dlls.len();
-
-    // pass 1: compute sizes and offsets
-    // IMAGE_IMPORT_DESCRIPTOR array: (num_dlls + 1) * 20 bytes
     let dir_size = (num_dlls + 1) * 20;
 
-    // per-dll ILT and IAT each hold (num_symbols + 1) * 8 bytes
     let mut ilt_offsets: Vec<usize> = Vec::new();
     let mut iat_offsets: Vec<usize> = Vec::new();
     let mut hint_offsets: Vec<Vec<usize>> = Vec::new();
@@ -163,84 +196,72 @@ pub fn build(dlls: &[ImportDll], section_rva: u32) -> Result<ImportTable, LinkEr
 
     let mut cur = dir_size;
 
-    // ILT block
     for dll in dlls {
         ilt_offsets.push(cur);
         cur += (dll.symbols.len() + 1) * 8;
     }
 
-    // IAT block (same size as ILT)
     for dll in dlls {
         iat_offsets.push(cur);
         cur += (dll.symbols.len() + 1) * 8;
     }
 
-    // hint/name table
     for dll in dlls {
         let mut sym_offsets = Vec::new();
         for sym in &dll.symbols {
             sym_offsets.push(cur);
-            cur += 2 + sym.name.len() + 1;
+            cur += 2 + sym.export_name.len() + 1;
             if cur % 2 != 0 { cur += 1; }
         }
         hint_offsets.push(sym_offsets);
     }
 
-    // DLL name strings
     for dll in dlls {
         dll_name_offsets.push(cur);
         cur += dll.dll_name.len() + 1;
         if cur % 2 != 0 { cur += 1; }
     }
 
-    let total = cur;
-    let mut data = vec![0u8; total];
+    let mut data = vec![0u8; cur];
     let mut iat_rvas: HashMap<String, u32> = HashMap::new();
 
-    // pass 2: write IMAGE_IMPORT_DESCRIPTORs
-    for i in 0..dlls.len() {
-        let desc_off = i * 20;
-        let ilt_rva = section_rva + ilt_offsets[i] as u32;
-        let iat_rva = section_rva + iat_offsets[i] as u32;
-        let name_rva = section_rva + dll_name_offsets[i] as u32;
-
-        write_u32(&mut data, desc_off, ilt_rva);
-        write_u32(&mut data, desc_off + 4, 0); // timestamp (filled by loader)
-        write_u32(&mut data, desc_off + 8, 0); // forwarder chain
-        write_u32(&mut data, desc_off + 12, name_rva);
-        write_u32(&mut data, desc_off + 16, iat_rva);
-        // null terminator descriptor is already zeroed
+    // write IMAGE_IMPORT_DESCRIPTORs
+    for i in 0..num_dlls {
+        let off = i * 20;
+        write_u32(&mut data, off, section_rva + ilt_offsets[i] as u32);
+        write_u32(&mut data, off + 4, 0);
+        write_u32(&mut data, off + 8, 0);
+        write_u32(&mut data, off + 12, section_rva + dll_name_offsets[i] as u32);
+        write_u32(&mut data, off + 16, section_rva + iat_offsets[i] as u32);
     }
+    // null terminator descriptor is already zeroed
 
-    // write ILT, IAT, hint/name table
+    // write ILT, IAT, hint/name entries
     for (i, dll) in dlls.iter().enumerate() {
         for (j, sym) in dll.symbols.iter().enumerate() {
             let hint_rva = section_rva + hint_offsets[i][j] as u32;
-            // high bit clear = import by name (bit 63 set = by ordinal)
+            // bit 63 clear = import by name
             let entry_val: u64 = hint_rva as u64;
 
-            let ilt_entry_off = ilt_offsets[i] + j * 8;
-            write_u64(&mut data, ilt_entry_off, entry_val);
+            write_u64(&mut data, ilt_offsets[i] + j * 8, entry_val);
+            write_u64(&mut data, iat_offsets[i] + j * 8, entry_val);
 
-            let iat_entry_off = iat_offsets[i] + j * 8;
-            write_u64(&mut data, iat_entry_off, entry_val);
+            // record both the imp_name and export_name -> IAT slot RVA
+            let iat_slot_rva = section_rva + iat_offsets[i] as u32 + j as u32 * 8;
+            iat_rvas.insert(sym.imp_name.clone(), iat_slot_rva);
+            iat_rvas.insert(sym.export_name.clone(), iat_slot_rva);
 
-            // record RVA of IAT slot for relocation patching
-            iat_rvas.insert(sym.name.clone(), section_rva + iat_entry_off as u32);
-
-            // write hint/name entry
-            let hn_off = hint_offsets[i][j];
-            write_u16_at(&mut data, hn_off, sym.hint);
-            let name_bytes = sym.name.as_bytes();
-            data[hn_off+2..hn_off+2+name_bytes.len()].copy_from_slice(name_bytes);
-            // null terminator already zero
+            // hint/name entry
+            let hn = hint_offsets[i][j];
+            write_u16_at(&mut data, hn, sym.hint);
+            let nb = sym.export_name.as_bytes();
+            data[hn+2..hn+2+nb.len()].copy_from_slice(nb);
         }
-        // null terminator entries for ILT and IAT are already zeroed
 
-        // write DLL name
-        let dn_off = dll_name_offsets[i];
-        let dll_bytes = dll.dll_name.as_bytes();
-        data[dn_off..dn_off+dll_bytes.len()].copy_from_slice(dll_bytes);
+        // DLL name string
+        let dn = dll_name_offsets[i];
+        let db = dll.dll_name.as_bytes();
+        data[dn..dn+db.len()].copy_from_slice(db);
     }
 
     Ok(ImportTable {

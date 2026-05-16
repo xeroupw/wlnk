@@ -82,7 +82,7 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
     // remove symbols resolved via imports from undefined list
     let import_resolved: Vec<String> = import_dlls
         .iter()
-        .flat_map(|dll| dll.symbols.iter().map(|s| s.name.clone()))
+        .flat_map(|dll| dll.symbols.iter().flat_map(|s| [s.export_name.clone(), s.imp_name.clone()]))
         .collect();
 
     // anything still undefined after import resolution is a hard error
@@ -197,7 +197,6 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
     // 10. emit PE
     // count final sections including .idata if non-empty
     let has_idata = !import_table.data.is_empty();
-    let _total_sections = merged.len() + if has_idata { 1 } else { 0 };
 
     let mut builder = PeBuilder::new(cfg.subsystem.clone(), entry_rva);
 
