@@ -47,22 +47,46 @@ jobs:
           $lib_dirs = $env:LIB -split ';' | Where-Object { $_ -ne '' }
           $lib_args = $lib_dirs | ForEach-Object { "--lib"; $_ }
 
+          # compiles a single .c file to .obj, returns $false on failure
+          function Compile-C {
+            param($src, $obj)
+            $out = cl.exe /nologo /c /O2 /GS- "$src" /Fo"$obj" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "  cl.exe failed: $out"
+              return $false
+            }
+            return $true
+          }
+
+          # links objs, runs exe, compares stdout to expected
+          # writes result directly to outer $passed/$failed/$errors via script scope
           function Run-Test {
-            param($name, $obj_files, $expected_file, $exe_file)
+            param($name, [string[]]$obj_files, $expected_file, $exe_file)
 
             Write-Host "--- $name wlnk call ---"
+            # redirect wlnk stdout to host directly, not captured
             & "$wlnk" @obj_files -o "$exe_file" --subsystem console --entry main @lib_args
-            if ($LASTEXITCODE -ne 0) { return "wlnk exited $LASTEXITCODE" }
+            if ($LASTEXITCODE -ne 0) {
+              $script:failed++
+              $script:errors += "FAIL $name : wlnk exited $LASTEXITCODE"
+              return
+            }
 
-            $proc = Start-Process -FilePath "$exe_file" -PassThru `
-              -RedirectStandardOutput "$env:TEMP\$name.stdout" -NoNewWindow
+            $stdout_file = "$env:TEMP\$name.stdout"
+            $proc = Start-Process `
+              -FilePath "$exe_file" `
+              -RedirectStandardOutput "$stdout_file" `
+              -NoNewWindow `
+              -PassThru
             $exited = $proc.WaitForExit(5000)
             if (-not $exited) {
               $proc.Kill()
-              return "exe timed out after 5s"
+              $script:failed++
+              $script:errors += "FAIL $name : exe timed out after 5s"
+              return
             }
 
-            $actual_raw = Get-Content "$env:TEMP\$name.stdout" -Raw
+            $actual_raw = if (Test-Path $stdout_file) { Get-Content $stdout_file -Raw } else { "" }
             $actual_raw = if ($null -eq $actual_raw) { "" } else { $actual_raw }
             $expected_raw = Get-Content $expected_file -Raw
             $expected_raw = if ($null -eq $expected_raw) { "" } else { $expected_raw }
@@ -70,10 +94,13 @@ jobs:
             $actual_norm = $actual_raw.Trim().Replace("`r`n", "`n")
             $expected_norm = $expected_raw.Trim().Replace("`r`n", "`n")
 
-            if ($actual_norm -ne $expected_norm) {
-              return "expected: $expected_norm`n  actual: $actual_norm"
+            if ($actual_norm -eq $expected_norm) {
+              $script:passed++
+              Write-Host "PASS $name"
+            } else {
+              $script:failed++
+              $script:errors += "FAIL $name`n  expected: $expected_norm`n  actual: $actual_norm"
             }
-            return $null
           }
 
           # single .c file tests
@@ -88,19 +115,17 @@ jobs:
               continue
             }
 
-            $cl_out = cl.exe /nologo /c /O2 /GS- $test.FullName /Fo"$obj_file" 2>&1
-            if ($LASTEXITCODE -ne 0) {
+            Write-Host "--- $name compile ---"
+            if (-not (Compile-C $test.FullName $obj_file)) {
               $failed++
-              $errors += "FAIL $name : cl.exe failed:`n$cl_out"
+              $errors += "FAIL $name : compile failed"
               continue
             }
 
-            $err = Run-Test $name @($obj_file) $expected_file $exe_file
-            if ($null -eq $err) { $passed++; Write-Host "PASS $name" }
-            else { $failed++; $errors += "FAIL $name : $err" }
+            Run-Test $name @($obj_file) $expected_file $exe_file
           }
 
-          # multi-obj tests: each subdirectory with an expected file
+          # multi-obj tests: subdirectories containing .c files and an expected file
           foreach ($dir in Get-ChildItem -Path $tests_dir -Directory) {
             $name = $dir.Name
             $expected_file = Join-Path $dir.FullName "expected"
@@ -116,25 +141,23 @@ jobs:
               continue
             }
 
-            $obj_files = @()
+            $obj_files = [System.Collections.Generic.List[string]]::new()
             $compile_ok = $true
             foreach ($src in $sources) {
               $obj = Join-Path $env:TEMP "$name-$($src.BaseName).obj"
-              $cl_out = cl.exe /nologo /c /O2 /GS- $src.FullName /Fo"$obj" 2>&1
-              if ($LASTEXITCODE -ne 0) {
+              Write-Host "--- $name compile $($src.Name) ---"
+              if (-not (Compile-C $src.FullName $obj)) {
                 $failed++
-                $errors += "FAIL $name : cl.exe failed on $($src.Name):`n$cl_out"
+                $errors += "FAIL $name : compile failed on $($src.Name)"
                 $compile_ok = $false
                 break
               }
-              $obj_files += $obj
+              $obj_files.Add($obj)
             }
             if (-not $compile_ok) { continue }
 
             $exe_file = Join-Path $env:TEMP "$name.exe"
-            $err = Run-Test $name $obj_files $expected_file $exe_file
-            if ($null -eq $err) { $passed++; Write-Host "PASS $name" }
-            else { $failed++; $errors += "FAIL $name : $err" }
+            Run-Test $name $obj_files.ToArray() $expected_file $exe_file
           }
 
           Write-Host ""
