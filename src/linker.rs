@@ -5,9 +5,11 @@
 
 use std::collections::HashMap;
 use std::fs;
+
 use crate::cli::Config;
 use crate::coff;
 use crate::error::LinkError;
+use crate::idata;
 use crate::pe::{
     OutputSection, PeBuilder, IMAGE_BASE, SECTION_ALIGN,
     align_up, section_characteristics_for,
@@ -15,11 +17,10 @@ use crate::pe::{
 use crate::reloc::{self, RelocationContext};
 use crate::symtab::SymbolTable;
 
-// groups all input sections by canonical name (.text, .data, .rdata, .bss)
+// section data merged from all input objects
 struct MergedSection {
     name: String,
     characteristics: u32,
-    // raw bytes concatenated from all contributing object sections
     data: Vec<u8>,
     // maps (obj_index, section_index) -> byte offset within merged data
     offsets: HashMap<(usize, usize), u32>,
@@ -39,7 +40,6 @@ impl MergedSection {
         let offset = self.data.len() as u32;
         self.offsets.insert((obj_index, sec_index), offset);
         self.data.extend_from_slice(data);
-        // align each contribution to 16 bytes within the merged section
         let pad = align_up(self.data.len() as u32, 16) as usize - self.data.len();
         self.data.extend(std::iter::repeat(0).take(pad));
         offset
@@ -47,7 +47,7 @@ impl MergedSection {
 }
 
 pub fn run(cfg: &Config) -> Result<(), LinkError> {
-    // ---- 1. load and parse all input .obj files ----
+    // 1. load and parse all input .obj files
     let mut objects: Vec<coff::CoffObject> = Vec::new();
     for path in &cfg.inputs {
         let raw = fs::read(path).map_err(|e| {
@@ -60,7 +60,7 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
         objects.push(obj);
     }
 
-    // ---- 2. build global symbol table ----
+    // 2. build global symbol table
     let mut symtab = SymbolTable::new();
     for (idx, obj) in objects.iter().enumerate() {
         symtab.ingest(idx, &obj.symbols)?;
@@ -68,16 +68,41 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
     for obj in &objects {
         symtab.collect_undefined(&obj.symbols);
     }
-    symtab.report_undefined()?;
+
+    // 3. collect undefined externals — these are candidates for DLL imports
+    let undefined: Vec<String> = symtab.undefined.clone();
+
+    // 4. resolve imports from .lib directories
+    let import_dlls = if !cfg.libs.is_empty() && !undefined.is_empty() {
+        idata::collect_imports(&cfg.libs, &undefined)?
+    } else {
+        Vec::new()
+    };
+
+    // remove symbols resolved via imports from undefined list
+    let import_resolved: Vec<String> = import_dlls
+        .iter()
+        .flat_map(|dll| dll.symbols.iter().map(|s| s.name.clone()))
+        .collect();
+
+    // anything still undefined after import resolution is a hard error
+    let still_undefined: Vec<String> = undefined
+        .iter()
+        .filter(|s| !import_resolved.contains(s))
+        .cloned()
+        .collect();
+
+    if !still_undefined.is_empty() {
+        return Err(LinkError::Coff(format!(
+            "undefined symbols: {}", still_undefined.join(", ")
+        )));
+    }
+
     symtab.check_entry(&cfg.entry)?;
 
-    // ---- 3. merge sections by canonical name ----
+    // 5. merge sections by canonical name
     let mut merged: Vec<MergedSection> = Vec::new();
-
-    // canonical ordering: .text first, then .rdata, .data, .bss, then rest
     let order = [".text", ".rdata", ".data", ".bss"];
-
-    // ensure canonical sections exist in order even if empty
     for name in &order {
         merged.push(MergedSection::new(name.to_string(), 0));
     }
@@ -93,19 +118,16 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
                     merged.last_mut().unwrap()
                 }
             };
-            // accumulate characteristics
             slot.characteristics |= section_characteristics_for(sec.characteristics);
             slot.append(obj_idx, sec_idx, &sec.data);
         }
     }
 
-    // remove empty placeholder sections
     merged.retain(|m| !m.data.is_empty() || m.name == ".text");
 
-    // ---- 4. assign virtual addresses ----
-    // headers occupy the first virtual page
+    // 6. assign virtual addresses to merged sections
     let headers_virt = align_up(
-        0x40 + 4 + 20 + 240 + (merged.len() as u32) * 40,
+        0x40 + 4 + 20 + 240 + (merged.len() as u32 + 1) * 40, // +1 for .idata
         SECTION_ALIGN,
     );
 
@@ -114,13 +136,20 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
 
     for sec in &merged {
         section_rvas.insert(sec.name.clone(), current_rva);
-        current_rva = align_up(current_rva + align_up(sec.data.len() as u32, SECTION_ALIGN), SECTION_ALIGN);
+        current_rva = align_up(
+            current_rva + align_up(sec.data.len() as u32, SECTION_ALIGN),
+            SECTION_ALIGN,
+        );
     }
 
-    // ---- 5. compute entry point RVA ----
+    // 7. build .idata section at current_rva
+    let idata_rva = current_rva;
+    let import_table = idata::build(&import_dlls, idata_rva)?;
+
+    // 8. compute entry point RVA
     let entry_rva = resolve_entry_rva(&cfg.entry, &objects, &symtab, &merged, &section_rvas)?;
 
-    // ---- 6. apply relocations ----
+    // 9. apply relocations
     let mut patched: Vec<Vec<u8>> = merged.iter().map(|m| m.data.clone()).collect();
 
     for (obj_idx, obj) in objects.iter().enumerate() {
@@ -139,31 +168,44 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
                         "relocation references out-of-bounds symbol index {}", reloc.symbol_index
                     )))?;
 
-                let target_va = resolve_symbol_va(
-                    target_sym,
-                    obj_idx,
-                    &objects,
-                    &symtab,
-                    &merged,
-                    &section_rvas,
-                )?;
+                // check if symbol is resolved via import table
+                let target_va = if let Some(&iat_rva) = import_table.iat_rvas.get(&target_sym.name) {
+                    iat_rva as u64 + IMAGE_BASE
+                } else {
+                    resolve_symbol_va(
+                        target_sym,
+                        obj_idx,
+                        &objects,
+                        &symtab,
+                        &merged,
+                        &section_rvas,
+                    )?
+                };
 
                 let patch_offset = sec_base_offset as usize + reloc.virtual_address as usize;
-
                 let ctx = RelocationContext {
                     section_va,
                     target_va,
                     reloc_offset: patch_offset,
                     reloc_type: reloc.reloc_type,
                 };
-
                 reloc::apply(&mut patched[out_sec_idx], &ctx)?;
             }
         }
     }
 
-    // ---- 7. emit PE ----
+    // 10. emit PE
+    // count final sections including .idata if non-empty
+    let has_idata = !import_table.data.is_empty();
+    let _total_sections = merged.len() + if has_idata { 1 } else { 0 };
+
     let mut builder = PeBuilder::new(cfg.subsystem.clone(), entry_rva);
+
+    // set import directory data directory entry
+    if has_idata {
+        builder.set_import_directory(idata_rva, import_table.data.len() as u32);
+    }
+
     for (i, sec) in merged.iter().enumerate() {
         builder.add_section(OutputSection {
             name: sec.name.clone(),
@@ -172,54 +214,57 @@ pub fn run(cfg: &Config) -> Result<(), LinkError> {
         });
     }
 
+    if has_idata {
+        // .idata: initialized data, readable
+        builder.add_section(OutputSection {
+            name: ".idata".to_string(),
+            characteristics: 0x40000040, // CNT_INITIALIZED_DATA | MEM_READ
+            data: import_table.data,
+        });
+    }
+
     let pe_bytes = builder.build()?;
     fs::write(&cfg.output, &pe_bytes)?;
 
-    println!(
-        "wlnk: wrote {} bytes to '{}'",
-        pe_bytes.len(),
-        cfg.output.display()
-    );
+    println!("wlnk: wrote {} bytes to '{}'", pe_bytes.len(), cfg.output.display());
 
     Ok(())
 }
 
-// resolves the virtual address (absolute, including image base) of a symbol
 fn resolve_symbol_va(
     sym: &coff::Symbol,
-    _obj_idx: usize,
+    obj_idx: usize,
     objects: &[coff::CoffObject],
     symtab: &SymbolTable,
     merged: &[MergedSection],
     section_rvas: &HashMap<String, u32>,
 ) -> Result<u64, LinkError> {
     if sym.is_defined() {
-        // symbol defined locally in this object
         let sec_idx = (sym.section_number - 1) as usize;
-        let obj_sec = objects[_obj_idx].sections.get(sec_idx)
+        let obj_sec = objects[obj_idx].sections.get(sec_idx)
             .ok_or_else(|| LinkError::Reloc(format!("symbol '{}' has invalid section index", sym.name)))?;
         let canon = canonical_name(&obj_sec.name);
         let merged_sec = merged.iter().find(|m| m.name == canon)
             .ok_or_else(|| LinkError::Reloc(format!("merged section '{}' not found", canon)))?;
-        let base_offset = *merged_sec.offsets.get(&(_obj_idx, sec_idx)).unwrap_or(&0);
+        let base_offset = *merged_sec.offsets.get(&(obj_idx, sec_idx)).unwrap_or(&0);
         let rva = section_rvas[&canon] as u64 + base_offset as u64 + sym.value as u64;
         Ok(rva + IMAGE_BASE)
     } else {
-        // external symbol: look up in global table
         let resolved = symtab.map.get(&sym.name)
             .ok_or_else(|| LinkError::Reloc(format!("unresolved symbol '{}'", sym.name)))?;
         let def_obj = &objects[resolved.obj_index];
         let def_sec = &def_obj.sections[resolved.section_index];
         let canon = canonical_name(&def_sec.name);
         let merged_sec = merged.iter().find(|m| m.name == canon)
-            .ok_or_else(|| LinkError::Reloc(format!("merged section '{}' not found for symbol '{}'", canon, sym.name)))?;
+            .ok_or_else(|| LinkError::Reloc(format!(
+                "merged section '{}' not found for symbol '{}'", canon, sym.name
+            )))?;
         let base_offset = *merged_sec.offsets.get(&(resolved.obj_index, resolved.section_index)).unwrap_or(&0);
         let rva = section_rvas[&canon] as u64 + base_offset as u64 + resolved.offset as u64;
         Ok(rva + IMAGE_BASE)
     }
 }
 
-// computes the RVA (relative to image base) of the entry point symbol
 fn resolve_entry_rva(
     entry: &str,
     objects: &[coff::CoffObject],
@@ -229,18 +274,15 @@ fn resolve_entry_rva(
 ) -> Result<u32, LinkError> {
     let resolved = symtab.map.get(entry)
         .ok_or_else(|| LinkError::Pe(format!("entry symbol '{}' not found", entry)))?;
-
     let def_obj = &objects[resolved.obj_index];
     let def_sec = &def_obj.sections[resolved.section_index];
     let canon = canonical_name(&def_sec.name);
     let merged_sec = merged.iter().find(|m| m.name == canon)
         .ok_or_else(|| LinkError::Pe(format!("merged section '{}' not found", canon)))?;
     let base_offset = *merged_sec.offsets.get(&(resolved.obj_index, resolved.section_index)).unwrap_or(&0);
-    let rva = section_rvas[&canon] + base_offset + resolved.offset;
-    Ok(rva)
+    Ok(section_rvas[&canon] + base_offset + resolved.offset)
 }
 
-// maps any section name variant to its canonical PE name
 fn canonical_name(name: &str) -> String {
     let base = name.splitn(2, '$').next().unwrap_or(name);
     match base {

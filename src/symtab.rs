@@ -88,6 +88,7 @@ impl SymbolTable {
     }
 
     // reports all undefined symbols as one error
+    #[allow(dead_code)]
     pub fn report_undefined(&self) -> Result<(), LinkError> {
         if self.undefined.is_empty() {
             return Ok(());

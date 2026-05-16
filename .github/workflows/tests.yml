@@ -87,11 +87,14 @@ jobs:
 
             # run and capture stdout
             $actual = & "$exe_file" 2>&1
-            $expected = Get-Content $expected_file -Raw
+
+            # Get-Content returns $null for empty files — coerce to empty string
+            $expected_raw = Get-Content $expected_file -Raw
+            $expected_raw = if ($null -eq $expected_raw) { "" } else { $expected_raw }
 
             # normalize line endings for comparison
-            $actual_norm = ($actual | Out-String).Trim().Replace("`r`n", "`n")
-            $expected_norm = $expected.Trim().Replace("`r`n", "`n")
+            $actual_norm = if ($null -eq $actual) { "" } else { ($actual | Out-String).Trim().Replace("`r`n", "`n") }
+            $expected_norm = $expected_raw.Trim().Replace("`r`n", "`n")
 
             if ($actual_norm -eq $expected_norm) {
               $passed++

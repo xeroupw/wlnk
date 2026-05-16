@@ -4,6 +4,7 @@
 mod cli;
 mod coff;
 mod error;
+mod idata;
 mod linker;
 mod pe;
 mod reloc;
